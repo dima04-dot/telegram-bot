@@ -1,18 +1,19 @@
-import telebot
-import requests
-import re
 import os
-from telebot import types
+import json
+import logging
+import requests
+import time
+from pathlib import Path
+import urllib3
 from flask import Flask
 from threading import Thread
-import time
 
 # ========== FLASK ДЛЯ PING ==========
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🌌 Планетарный анализатор работает"
+    return "🌌 Астрологический бот работает"
 
 @app.route('/ping')
 def ping():
@@ -26,263 +27,384 @@ def run_flask():
     print("🚀 Запуск Flask сервера...")
     app.run(host='0.0.0.0', port=8080)
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 # ========== СИСТЕМА ДОСТУПА ==========
-# 🔹 ЗАМЕНИТЕ ЭТИ ID НА СВОИ!
-ALLOWED_USERS = [1948172415,878048905]  # Ваш ID уже есть
+ALLOWED_USERS = [1948172415]  # 🔹 Ваш ID
 
 def check_access(user_id):
     return user_id in ALLOWED_USERS
 
 def private_access_required(func):
     def wrapper(message):
-        if not check_access(message.from_user.id):
-            bot.reply_to(message, 
-                f"⛔ Доступ запрещен. Ваш ID: `{message.from_user.id}`\n"
-                "Запросите доступ у администратора.",
-                parse_mode='Markdown')
-            return
+        if not check_access(message.get('from', {}).get('id')):
+            return {"error": "Access denied"}
         return func(message)
     return wrapper
 
-# ========== ТЕЛЕГРАМ БОТ ==========
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-GEN_API_KEY = os.getenv('GEN_API_KEY') 
-GEN_API_URL = os.getenv('GEN_API_URL', 'https://api.gen-api.ru/api/v1/networks/gpt-4o-mini')
+# ========== КОНФИГУРАЦИЯ ==========
+# В Render Environment Variables добавьте:
+# TELEGRAM_BOT_TOKEN = ваш токен
+# GEN_API_KEY = sk-BupGwWxdPav0VY1eIHwryfLQAnWgcVyZjacxxyok5mw16YyK5wyqPJyRCyOb
 
-if not TELEGRAM_TOKEN or not GEN_API_KEY:
-    print("❌ ОШИБКА: Не заданы TELEGRAM_TOKEN или GEN_API_KEY в Render!")
-    print("Задайте их в Environment Variables")
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+GEN_API_KEY = os.environ.get('GEN_API_KEY', "sk-BupGwWxdPav0VY1eIHwryfLQAnWgcVyZjacxxyok5mw16YyK5wyqPJyRCyOb")
+GEN_API_URL = "https://api.gen-api.ru/api/v1/networks/gpt-4o-mini"
+
+if not TELEGRAM_BOT_TOKEN:
+    logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
     exit(1)
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+logger.info("✅ Все токены загружены успешно!")
 
-# ========== КОМАНДА ДЛЯ ПОЛУЧЕНИЯ ID ==========
-@bot.message_handler(commands=['myid'])
-def show_my_id(message):
-    user = message.from_user
-    response = (
-        f"🆔 *Ваш ID:* `{user.id}`\n"
-        f"👤 *Имя:* {user.first_name}\n"
-        f"📛 *Юзернейм:* @{user.username if user.username else 'нет'}\n"
-        f"✅ *Доступ:* {'ЕСТЬ ✅' if check_access(user.id) else 'НЕТ ❌'}"
-    )
-    bot.reply_to(message, response, parse_mode='Markdown')
+# Глобальные переменные
+last_update_id = 0
+file_cache = {}
+last_cache_update = 0
 
-# ========== ВАШ ОРИГИНАЛЬНЫЙ КОД ==========
-PLANET_KEYWORDS = {
-    "Солнце": ["я", "мне", "меня", "мой", "моя", "моё", "мои",
-               "сам", "сама", "само", "сами", "личность",  "индивидуальность", "личный"],
+# ========== TELEGRAM ФУНКЦИИ ==========
+def get_updates(token, offset=None):
+    """Получение обновлений через polling"""
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    params = {"timeout": 30}
+    if offset:
+        params["offset"] = offset
 
-    "Луна": ["семья", "семьи", "семье", "семью", "семьей", "чувствую", "чувствовать", "чувства",
-             "эмоции", "эмоциональный", "душа", "душевный", "земля", "земли", "недвижимость",
-             "дом", "дома", "квартира", "жилье", "мать", "мама", "материнский", "жилище"],
-
-    "Меркурий": ["спрашиваю", "спрашивать", "вопрос", "спросить", "учусь", "учиться", "учеба",
-                 "учить", "курсы", "ездить",  "автомобиль", "иду",  "идём",
-                 "машина", "транспорт", "контакты", "контакт", "телефон", "звонить", "позвонить",
-                 "звонок", "общение", "общаться", "сообщение", "письмо", "документ", "договор"],
-
-    "Венера": ["нравится", "нравиться", "любить", "люблю", "любимый", "еда", "кушать", "есть",
-               "пища", "деньги", "деньгам", "деньгами", "покупка", "купить", "покупать", "ем", "удовольствие",
-               "красиво", "красивый", "красивая", "красота", "одежда", "одежду", "наряды", "стиль",
-               "гармония", "искусство", "музыка", "творчество", "ценности", "ценный"],
-
-    "Марс": ["сделать", "делаю", "делает", "делаем", "действие", "активный", "активность","играть","спортивный","спорт", "заниматься",
-             "быстрый", "быстро", "скорость","срочно", "импульсивный", "импульс", "энергия", "энергичный", "тренироваться",
-             "борьба", "бороться", "соревнование", "соревноваться", "сила", "сильный", "напористый"],
-
-    "Юпитер": ["люди", "компания", "компании", "коллектив", "общество", "группа", "много", "наш", "наша", "наше", "наши",
-               "социум", "знакомые", "знакомый", "друзья", "видеть", "вижу", "смотреть", "все",
-               "смотрю","мы"],
-
-    "Сатурн": ["структура", "структурный", "работа", "работе", "работать", "труд", "планировать", "нужно",
-               "план", "планирование", "администрация", "административный", "управлять", "необходимо",
-               "управление", "руководство", "ответственность", "ответственный", "дисциплина",
-               "дисциплинированный"],
-
-    "Уран": ["уезжать", "уехать", "едем", "переезжать", "переехать", "переезд", "летать", "полет",
-             "самолет", "иностранцы", "иностранный", "обучать","граница", "путешествовать","поехал",
-             "обучение", "учить", "учитель", "улетать", "революционный", "технологии","еду",
-             "технологический", "свобода", "свободный", "неожиданность", "неожиданный"],
-
-    "Нептун": ["хотеть", "хочу", "хочешь", "желать", "желание", "мечтать", "мечта", "мания","получать", "получишь",
-               "одержимость", "чужие деньги", "долги", "кредит", "забирать", "забрать", "взять","закупился", "большие деньги",
-               "употреблять", "употребление"],
-
-    "Плутон": ["партнёр", "партнер", "партнерша", "суды", "суд", "судебный", "вместе", "совместно",
-               "вдвоём", "двое", "договор", "контракт", "соглашение", "брачный союз", "брак",
-               "женитьба", "замужество", "друг"]
-}
-
-
-PLANET_SYMBOLS = {
-    "Солнце": "☉",
-    "Луна": "☽",
-    "Меркурий": "☿",
-    "Венера": "♀",
-    "Марс": "♂",
-    "Юпитер": "♃",
-    "Сатурн": "♄",
-    "Уран": "♅",
-    "Нептун": "♆",
-    "Плутон": "♇"
-}
-
-WORD_TO_PLANET = {}
-for planet, words in PLANET_KEYWORDS.items():
-    for word in words:
-        WORD_TO_PLANET[word] = planet
-
-def analyze_text_locally_by_words(text):
-    """Локальный анализ текста по словам"""
-    text_lower = text.lower()
-    text_clean = re.sub(r'[^\w\s]', ' ', text_lower)
-    words = text_clean.split()
-    
-    result_symbols = []
-    
-    for word in words:
-        if word in WORD_TO_PLANET:
-            result_symbols.append(PLANET_SYMBOLS[WORD_TO_PLANET[word]])
-            continue
-            
-        found = False
-        for keyword, planet in WORD_TO_PLANET.items():
-            if len(keyword) > 3 and len(word) > 3:
-                if (keyword in word or word in keyword or
-                        keyword.startswith(word[:3]) or word.startswith(keyword[:3])):
-                    result_symbols.append(PLANET_SYMBOLS[planet])
-                    found = True
-                    break
-        
-        if not found:
-            result_symbols.append("  .  ")
-    
-    if result_symbols:
-        return "    ".join(result_symbols)
-    else:
-        return "    "
-
-def analyze_text_with_gpt_simple(text):
-    """Простой анализ через GPT API"""
-    headers = {
-        "Authorization": f"Bearer {GEN_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    prompt = f'''Определи какие слова соответствуют планетам и покажи эти планеты по порядку:
-Текст: "{text}"
-выдавай подобные слова, если они пишутся похоже как и в тексте.
-Верни ТОЛЬКО символы планет в порядке слов. Если символы слов повторяются, также показывай повторно планеты.'''
-    
-    data = {
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-        "max_tokens": 50
-    }
-    
     try:
-        response = requests.post(GEN_API_URL, headers=headers, json=data, timeout=10)
-        if response.status_code == 200:
-            result = response.json()
-            content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            
-            lines = content.split('\n')
-            for line in lines:
-                line = line.strip()
-                if any(symbol in line for symbol in PLANET_SYMBOLS.values()):
-                    cleaned = re.sub(r'[^☉☽☿♀♂♃♄♅♆♇\s]', '', line)
-                    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-                    if cleaned:
-                        return cleaned
-            return None
-        else:
-            print(f"GPT API Error: {response.status_code}")
-            return None
+        response = requests.get(url, params=params, timeout=35)
+        return response.json()
     except Exception as e:
-        print(f"GPT Connection Error: {e}")
+        logger.error(f"Ошибка получения обновлений: {e}")
         return None
 
-def create_keyboard():
-    """Создает клавиатуру с кнопками"""
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
-    btn_start = types.KeyboardButton("🚀 Старт")
-    btn_reset = types.KeyboardButton("🔄 Сброс")
-    btn_input = types.KeyboardButton("✍️ Ввести")
-    keyboard.add(btn_start, btn_reset, btn_input)
-    return keyboard
+def send_message(token, chat_id, text, reply_markup=None):
+    """Отправка сообщения с кнопками"""
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
 
-# ========== ОБРАБОТЧИКИ С ПРОВЕРКОЙ ДОСТУПА ==========
-@bot.message_handler(commands=['start'])
-@private_access_required
-def send_welcome(message):
-    """Обработчик команды /start"""
-    chat_id = message.chat.id
-    keyboard = create_keyboard()
-    welcome_text = "🌌 *Планетарный Анализатор* 🌌\n\nНажмите '✍️ Ввести' → напишите предложение\n→ получите символы планет"
-    bot.send_message(chat_id, welcome_text, reply_markup=keyboard, parse_mode='Markdown')
-
-@bot.message_handler(func=lambda message: message.text == "🚀 Старт")
-@private_access_required
-def handle_start_button(message):
-    chat_id = message.chat.id
-    start_text = "📝 *Примеры:*\n\n`Я живу дома и ем сладкое`\n→ ☉ ☽ ♀\n\n`Еду на работу за деньгами`\n→ ☿ ♄ ♀\n\n`Хочу купить машину`\n→ ♆ ♀ ☿"
-    bot.send_message(chat_id, start_text, parse_mode='Markdown')
-
-@bot.message_handler(func=lambda message: message.text == "🔄 Сброс")
-@private_access_required
-def handle_reset_button(message):
-    bot.send_message(message.chat.id, "✅ Готово")
-
-@bot.message_handler(func=lambda message: message.text == "✍️ Ввести")
-@private_access_required
-def handle_input_button(message):
-    bot.send_message(message.chat.id, "📝 *Введите предложение:*", parse_mode='Markdown')
-
-@bot.message_handler(content_types=['text'])
-@private_access_required
-def handle_text(message):
-    chat_id = message.chat.id
-    user_text = message.text.strip()
-    
-    if user_text in ["🚀 Старт", "🔄 Сброс", "✍️ Ввести"]:
-        return
-    
-    if not user_text:
-        bot.send_message(chat_id, "Пожалуйста, введите текст.")
-        return
-    
-    bot.send_chat_action(chat_id, 'typing')
-    
-    result = analyze_text_locally_by_words(user_text)
-    
-    if result == "—" or "—" in result:
-        gpt_result = analyze_text_with_gpt_simple(user_text)
-        if gpt_result:
-            result = gpt_result
-    
-    if result:
-        result = result.replace("—", "").strip()
-        result = re.sub(r'\s+', ' ', result)
-    
-    if result:
-        bot.send_message(chat_id, f"<b>{result}</b>", parse_mode='HTML')
-    else:
-        bot.send_message(chat_id, " ")
-    
-    keyboard = create_keyboard()
-
-def setup_bot():
-    """Настройка бота перед запуском"""
-    print("🔧 Настройка бота...")
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook"
-        response = requests.get(url, timeout=5)
-        if response.json().get("ok"):
-            print("✅ Вебхук удален")
-    except:
-        print("ℹ️ Вебхук не активен")
+        response = requests.post(url, json=payload, timeout=10)
+        return response
+    except Exception as e:
+        logger.error(f"Ошибка отправки сообщения: {e}")
+        return None
+
+def send_permanent_buttons(chat_id):
+    """Отправка постоянных кнопок"""
+    keyboard = {
+        "keyboard": [
+            [{"text": "✨ Задать вопрос"}],
+            [{"text": "🔄 Сбросить"}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False
+    }
+
+    send_message(TELEGRAM_BOT_TOKEN, chat_id,
+                 " Приветствую вас! ✨\n\n"
+                 "Задавайте вопросы связанные с аспектацией планет.\n"
+                 "Используйте кнопки ниже:",
+                 keyboard)
+
+# ========== ЧТЕНИЕ ФАЙЛОВ ==========
+def read_local_file(filename):
+    """Читает файл с локального компьютера с кэшированием"""
+    global file_cache, last_cache_update
+
+    # Проверяем кэш
+    if filename in file_cache and (time.time() - last_cache_update) < 300:
+        return file_cache[filename]
+
+    try:
+        # Путь к файлам в Render
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(base_dir, "texts", filename)
+        
+        if os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if content:
+                    file_cache[filename] = content
+                    return content
+                else:
+                    logger.warning(f"Файл {filename} пустой")
+                    return None
+        else:
+            logger.warning(f"Файл не найден: {file_path}")
+            return None
+    except Exception as e:
+        logger.warning(f"Ошибка чтения файла {filename}: {e}")
+        return None
+
+def get_all_files_from_local():
+    """Получает файлы с локального компьютера с оптимизацией"""
+    global file_cache, last_cache_update
+
+    # Обновляем кэш если прошло больше 5 минут
+    if (time.time() - last_cache_update) > 300:
+        file_cache = {}
+        last_cache_update = time.time()
+
+    all_files = []
+
+    # Категории файлов
+    categories = {
+        "ПЛАНЕТЫ": [
+            "planet_марс.txt", "planet_венера.txt", "planet_луна.txt",
+            "planet_меркурий.txt", "planet_солнце.txt", "planet_юпитер.txt",
+            "planet_сатурн.txt", "planet_уран.txt", "planet_нептун.txt",
+            "planet_плутон.txt", "planet_Лилит.txt", "planet_Чёрная_луна.txt"
+        ],
+        "ЗНАКИ ЗОДИАКА": [
+            "sign_Овен.txt", "sign_Телец.txt", "sign_Близнецы.txt",
+            "sign_Рак.txt", "sign_Лев.txt", "sign_Дева.txt",
+            "sign_Весы.txt", "sign_Скорпион.txt", "sign_Стрелец.txt",
+            "sign_Козерог.txt", "sign_Водолей.txt", "sign_Рыбы.txt"
+        ],
+        "ДОМА": [
+            "house_1.txt", "house_2.txt", "house_3.txt",
+            "house_4.txt", "house_5.txt", "house_6.txt",
+            "house_7.txt", "house_8.txt", "house_9.txt",
+            "house_10.txt", "house_11.txt", "house_12.txt"
+        ],
+        "АСПЕКТЫ": [
+            "aspect_150.txt", "aspect_180.txt", "aspect_0.txt",
+            "aspect_60.txt", "aspect_90.txt", "aspect_120.txt"
+        ]
+    }
+
+    total_files = sum(len(files) for files in categories.values())
+    logger.info(f"Ищем {total_files} файлов...")
+
+    found_files = 0
+    for category, filenames in categories.items():
+        category_content = []
+        category_found = 0
+
+        for filename in filenames:
+            content = read_local_file(filename)
+            if content:
+                # Берем только первые 500 символов каждого файла для оптимизации
+                truncated_content = content[:500] + ("..." if len(content) > 500 else "")
+                category_content.append(f"[{filename}]: {truncated_content}")
+                category_found += 1
+                found_files += 1
+
+        if category_content:
+            all_files.append(f"=== {category} ===\n" + "\n".join(category_content) + "\n")
+
+    logger.info(f"Прочитано: {found_files} файлов из {total_files}")
+    return all_files
+
+# ========== GEN API ФУНКЦИИ ==========
+def call_gen_api(system_prompt, user_question):
+    """Вызов gen-api с правильной обработкой ответа"""
+    try:
+        logger.info("Отправка запроса к gen-api...")
+
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {GEN_API_KEY}'
+        }
+
+        payload = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_question}
+            ],
+            "is_sync": True,
+            "max_tokens": 1000,
+            "temperature": 0.2
+        }
+
+        response = requests.post(GEN_API_URL, json=payload, headers=headers, timeout=45)
+
+        if response.status_code == 200:
+            result = response.json()
+            logger.info(f"Полный ответ от API: {json.dumps(result, ensure_ascii=False)[:200]}...")
+
+            # Правильная обработка ответа по новому формату
+            if isinstance(result, dict):
+                if 'response' in result and isinstance(result['response'], list):
+                    response_list = result['response']
+                    if len(response_list) > 0:
+                        first_response = response_list[0]
+                        if isinstance(first_response, dict) and 'message' in first_response:
+                            message = first_response['message']
+                            if isinstance(message, dict) and 'content' in message:
+                                answer = message['content']
+                                logger.info("✅ Ответ извлечен успешно (новый формат)")
+                                return answer
+
+                elif 'output' in result:
+                    answer = str(result['output'])
+                    logger.info("✅ Ответ извлечен успешно (output)")
+                    return answer
+                elif 'choices' in result and len(result['choices']) > 0:
+                    choice = result['choices'][0]
+                    if isinstance(choice, dict):
+                        if 'message' in choice:
+                            answer = str(choice['message'].get('content', ''))
+                            logger.info("✅ Ответ извлечен успешно (choices)")
+                            return answer
+                        elif 'content' in choice:
+                            answer = str(choice.get('content', ''))
+                            logger.info("✅ Ответ извлечен успешно (content)")
+                            return answer
+
+            answer = str(result)
+            logger.info("✅ Ответ извлечен как строка")
+            return answer
+
+        elif response.status_code == 429:
+            return "❌ Превышен лимит запросов. Подождите несколько минут."
+        else:
+            logger.error(f"Ошибка gen-api: {response.status_code}")
+            logger.error(f"Ответ: {response.text}")
+            return f"❌ Ошибка gen-api: {response.status_code}"
+
+    except requests.exceptions.Timeout:
+        logger.error("Таймаут запроса к gen-api")
+        return "❌ Запрос занял слишком много времени. Попробуйте уточнить вопрос."
+    except Exception as e:
+        logger.error(f"Ошибка запроса к gen-api: {e}")
+        return "❌ Ошибка при обращении к AI-модели. Попробуйте позже."
+
+# ========== ОБРАБОТЧИК СООБЩЕНИЙ ==========
+def process_message(message):
+    """Обработка одного сообщения"""
+    chat_id = message.get('chat', {}).get('id')
+    user_question = message.get('text', '').strip()
+
+    if not chat_id:
+        return
+
+    logger.info(f"Сообщение: {user_question}")
+
+    # Проверка доступа
+    user_id = message.get('from', {}).get('id')
+    if not check_access(user_id):
+        send_message(TELEGRAM_BOT_TOKEN, chat_id, 
+                    f"⛔ Доступ запрещен. Ваш ID: {user_id}\nЗапросите доступ у администратора.")
+        return
+
+    # Команды
+    if user_question.lower() in ['/start', '✨ задать вопрос', 'задать вопрос', '/myid']:
+        if user_question == '/myid':
+            user = message.get('from', {})
+            response = (
+                f"🆔 *Ваш ID:* `{user.get('id', 'N/A')}`\n"
+                f"👤 *Имя:* {user.get('first_name', 'N/A')}\n"
+                f"📛 *Юзернейм:* @{user.get('username', 'нет')}\n"
+                f"✅ *Доступ:* {'ЕСТЬ ✅' if check_access(user.get('id')) else 'НЕТ ❌'}"
+            )
+            send_message(TELEGRAM_BOT_TOKEN, chat_id, response)
+        else:
+            send_permanent_buttons(chat_id)
+        return
+
+    if user_question.lower() in ['🔄 сбросить', 'сбросить', '/reset']:
+        send_permanent_buttons(chat_id)
+        send_message(TELEGRAM_BOT_TOKEN, chat_id, "🔄 Диалог сброшен. Готовы к новому вопросу!")
+        return
+
+    # Пустые сообщения
+    if len(user_question) < 2:
+        send_message(TELEGRAM_BOT_TOKEN, chat_id,
+                     "📝 Задавайте вопрос связанный с аспектацией планет.")
+        send_permanent_buttons(chat_id)
+        return
+
+    # Отправляем статус
+    keyboard = {
+        "keyboard": [
+            [{"text": "✨ Задать вопрос"}],
+            [{"text": "🔄 Сбросить"}]
+        ],
+        "resize_keyboard": True
+    }
+    send_message(TELEGRAM_BOT_TOKEN, chat_id, "⏳ Идёт анализ, ждите...", keyboard)
+
+    try:
+        # Читаем файлы
+        logger.info("Чтение файлов...")
+        all_files_content = get_all_files_from_local()
+
+        if not all_files_content:
+            send_message(TELEGRAM_BOT_TOKEN, chat_id,
+                         "❌ Не удалось прочитать файлы из базы знаний.")
+            return
+
+        # Формируем промпт
+        files_text = "\n".join(all_files_content)
+
+        system_prompt = f"""ТЫ - эксперт! Используй информацию ТОЛЬКО из предоставленных файлов.
+
+ДОСТУПНЫЕ ДАННЫЕ:
+{files_text}
+
+ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:
+
+1. СТРОГО ИСПОЛЬЗУЙ ТОЛЬКО информацию из файлов выше
+2. СОСТАВЛЯЙ уверенно короткие предложения из ключевых слов из файлов 
+3. соединяй ключевые слова и сумируй их в текст
+4. ОТВЕЧАЙ полноценно и четко и по делу
+5. ВАЖНО!---Не используй свои знания и информацию из интернета !!!
+6. Отвечай только по теме АСПЕКТАЦИИ ПЛАНЕТ, Знаков, ДОМОВ
+
+ВОПРОС ПОЛЬЗОВАТЕЛЯ:"""
+
+        # Запрашиваем gen-api
+        logger.info("Вызов gen-api...")
+        gpt_response = call_gen_api(system_prompt, user_question)
+
+        # Отправляем ответ
+        send_message(TELEGRAM_BOT_TOKEN, chat_id, gpt_response, keyboard)
+        logger.info("Ответ отправлен успешно")
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки: {e}")
+        send_message(TELEGRAM_BOT_TOKEN, chat_id,
+                     "❌ Произошла ошибка. Попробуйте позже.", keyboard)
+
+# ========== ГЛАВНЫЙ ЦИКЛ ==========
+def telegram_polling():
+    """Главный цикл Telegram"""
+    global last_update_id
+
+    logger.info("🚀 Telegram бот запущен!")
+
+    while True:
+        try:
+            updates = get_updates(TELEGRAM_BOT_TOKEN, last_update_id + 1 if last_update_id > 0 else None)
+
+            if updates and updates.get('ok') and updates.get('result'):
+                for update in updates['result']:
+                    update_id = update.get('update_id', 0)
+                    message = update.get('message', {})
+
+                    if message and update_id > last_update_id:
+                        process_message(message)
+                        last_update_id = update_id
+
+            time.sleep(1)
+
+        except KeyboardInterrupt:
+            logger.info("🛑 Бот остановлен пользователем")
+            break
+        except Exception as e:
+            logger.error(f"🔥 Ошибка в основном цикле: {e}")
+            time.sleep(5)
 
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
@@ -291,12 +413,9 @@ if __name__ == "__main__":
     flask_thread.daemon = True
     flask_thread.start()
     
-    # Настраиваем и запускаем бота
-    setup_bot()
-    
     print("=" * 50)
-    print("🚀 Запуск Telegram бота...")
-    print(f"🤖 Токен: {TELEGRAM_TOKEN[:10]}...")
+    print("🚀 Запуск астрологического бота...")
+    print(f"🤖 Токен: {TELEGRAM_BOT_TOKEN[:10]}...")
     print(f"🔑 API ключ: {GEN_API_KEY[:10]}...")
     print(f"👥 Разрешено пользователей: {len(ALLOWED_USERS)}")
     print("🌐 Flask сервер на порту 8080")
@@ -304,9 +423,5 @@ if __name__ == "__main__":
     print("✍️ Напишите /start или /myid")
     print("=" * 50)
     
-    try:
-        bot.polling(none_stop=True, interval=2, timeout=30)
-    except Exception as e:
-        print(f"❌ Ошибка: {e}")
-        print("🔄 Перезапуск через 10 секунд...")
-        time.sleep(10)
+    # Запускаем Telegram polling
+    telegram_polling()
